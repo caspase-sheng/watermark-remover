@@ -1,0 +1,29 @@
+# Python 缓存
+__pycache__/
+*.pyc
+
+# 输入输出：这些是本地跑出来的东西，不往仓库里放
+input/
+output/
+
+# 视频文件（测试素材）
+*.mp4
+*.avi
+*.mov
+
+# 模型权重：体积大，用 download_models.py 自己下
+models/
+*.pth
+*.ckpt
+
+# 虚拟环境
+.conda/
+.venv/
+venv/
+.env
+
+# 系统垃圾文件
+.DS_Store
+Thumbs.db
+
+.idea/

@@ -1,0 +1,29 @@
+# pip 依赖（conda 装不上时的备选方案）
+#
+# PyTorch 需要单独用官方 CUDA 12.1 源安装，不要直接 pip install torch：
+#   pip install torch==2.1.2 torchvision==0.16.2 --index-url https://download.pytorch.org/whl/cu121
+#
+# 然后再装剩下的：
+#   pip install -r requirements.txt
+
+# numpy 锁在 1.x：torch 2.1.2 是按 numpy 1.x 编译的，升到 2.x 会有 ABI 警告
+numpy>=1.24,<2.0
+
+opencv-python>=4.8
+pillow>=9.5
+PyYAML>=6.0
+tqdm>=4.66
+
+# 时间轴平滑（temporal.py）用到的中值/均值滤波
+scipy>=1.10
+
+# LaMa 修复模型。权重不随包分发，首次运行会从 GitHub Releases
+# 下载 big-lama.pt（约 196MB）并缓存到 ~/.cache/torch/hub/checkpoints/
+simple-lama-inpainting==0.1.2
+
+# 自带 ffmpeg 可执行文件，系统不需要单独安装 FFmpeg
+imageio-ffmpeg>=0.4.9
+
+# Web 界面（gradio_app.py）。锁在 5.x：5.50 的 ImageEditor / 主题 API 是当前代码用到的
+# 那套写法；6.0 把 theme / css 挪到了 launch()，先不跟。
+gradio>=4.44,<6

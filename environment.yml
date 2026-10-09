@@ -1,0 +1,51 @@
+# 视频水印去除工具  conda 环境
+#
+# 创建环境：
+#   conda env create -f environment.yml
+# 更新环境：
+#   conda env update -f environment.yml --prune
+#
+# 说明：
+#   PyTorch 走 conda 官方 pytorch / nvidia 频道，装 CUDA 12.1 版本；
+#   OpenCV、Pillow 等纯 Python 包走 pip（PyPI），避免 conda 和 pip 各装一份 cv2 互相打架。
+#
+#   这里没有用 conda-forge：conda-forge 的 win-64 repodata 体积很大，
+#   国内网络下经常拉不完导致 solving 一直超时。python 从 defaults 拿就够用了。
+#   如果直连 repo.anaconda.com 也很慢，可以先配一下国内镜像：
+#     conda config --add channels https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/main
+#     conda config --add channels https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud/pytorch
+#   注意 TUNA 没有镜像 nvidia 频道，pytorch-cuda 仍需直连 conda.anaconda.org。
+
+name: watermark-remover
+
+channels:
+  - pytorch
+  - nvidia
+  - defaults
+
+dependencies:
+  - python=3.10
+
+  # PyTorch 2.1.2 + CUDA 12.1。RTX 4060（驱动 566.24）可以直接用。
+  - pytorch=2.1.2
+  - torchvision=0.16.2
+  - pytorch-cuda=12.1
+
+  # torch 2.1.2 是按 numpy 1.x 编译的，numpy 2.x 会触发 ABI 警告，这里锁在 1.x
+  - numpy>=1.24,<2.0
+
+  - pip
+  - pip:
+      - opencv-python>=4.8
+      - pillow>=9.5
+      - PyYAML>=6.0
+      - tqdm>=4.66
+      # 时间轴平滑（temporal.py）用到的中值/均值滤波
+      - scipy>=1.10
+      # LaMa 修复模型。权重不随包分发，首次运行会从 GitHub Releases
+      # 下载 big-lama.pt（约 196MB）并缓存到 ~/.cache/torch/hub/checkpoints/
+      - simple-lama-inpainting==0.1.2
+      # 自带 ffmpeg 可执行文件，所以系统不用单独装 FFmpeg
+      - imageio-ffmpeg>=0.4.9
+      # Web 界面（gradio_app.py），锁在 5.x 系列
+      - gradio>=4.44,<6

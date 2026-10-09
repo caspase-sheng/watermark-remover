@@ -1,0 +1,70 @@
+# ============================================================================
+# 去水印配置
+#
+# region：水印在画面里的位置，由 select_region.py 框选生成，也可以手动微调
+#   x / y / w / h      —— 水印框左上角坐标和宽高（按 ref 分辨率量的绝对像素）
+#   ref_width / ref_height —— 框选时那个视频的分辨率。水印跟着画面一起缩放，
+#                             input 里视频分辨率不一致时靠这两个值等比换算，推荐都填上
+#
+# inpaint_method：修复方式，两种可切换
+#   lama（默认）—— 逐帧修，每帧只看自己这一张图。快，动画/插画风、背景基本不动时够用；
+#                  但被挡住的背景是"编"出来的，背景一变就容易糊、容易闪。推荐先用它试。
+#   sttn        —— 把水印附近的帧当一整段视频一起修，会参考前后帧没被挡住的背景。
+#                  实拍、纹理丰富、背景在动（镜头平移、物体经过）时补得更自然，慢一些。
+#   opencv      —— 降级方案（cv2.inpaint），不用下权重，效果一般，装不上 LaMa 时可以顶着用
+#
+# inpaint：
+#   device      —— auto / cuda / cpu。推荐 auto，有显卡就用显卡
+#   padding     —— ROI 在水印框基础上往外扩的像素，推荐 20。显存不够就调小（如 8）
+#   mask_dilate —— 掩码膨胀像素，用来吃掉水印边缘的抗锯齿，推荐 4；
+#                  水印外圈剩白边就调到 10~14
+#
+# sttn（inpaint_method: sttn 时生效）：
+#   segment_size      —— 一次送进网络的帧数，推荐 10（5~10 都行）。越大参考的时间信息越多，
+#                        但显存涨得很快（注意力是帧数平方级），不够时程序会自动对半调小重试
+#   neighbor_stride   —— 相邻窗口步长，推荐 5。越小重叠越多、越稳，也越慢
+#   reference_length  —— 每个窗口额外参考的帧数，推荐 10
+#   min_segment_size  —— 显存不足时自动下调的下限，推荐 2，降到这个值还不够就会报错
+#   context_scale     —— 送进 STTN 的参考带子比水印框放大多少倍，推荐 2（2~3 比较合适）。
+#                        带子里没被挡住的部分越多越有东西可参考；太小（1）会让 mask 占满带子，补出来发糊
+#   model_path        —— 权重路径，留空用 models/sttn-det.safetensors（首次运行自动下载）
+#
+# output：
+#   crf    —— H.264 质量，推荐 18（数字越小画质越好、文件越大）
+#   preset —— 编码速度档位，推荐 slow。想快点出结果可以改 medium
+#
+# 后处理（两个独立开关，可以各自关掉）：
+#   temporal_enable —— 修复结果沿时间轴做中值滤波，压掉帧间闪烁，推荐 true
+#   temporal_window —— 平滑窗口（帧），推荐 3；取奇数，1 等于不平滑，5 更稳但快速运动时可能轻微拖影
+#   feather_px      —— 贴回时边缘羽化的像素数，推荐 8；0 表示不羽化
+# ============================================================================
+region:
+  x: 2264
+  y: 1301
+  w: 206
+  h: 109
+  ref_width: 2560
+  ref_height: 1440
+inpaint_method: lama
+inpaint:
+  device: auto
+  padding: 20
+  mask_dilate: 4
+
+# STTN 相关参数（inpaint_method: sttn 时生效）
+# 各参数的作用和推荐值都写在文件顶部，这里只列出来方便对照修改
+sttn:
+  segment_size: 10
+  neighbor_stride: 5
+  reference_length: 10
+  min_segment_size: 2
+  context_scale: 2.0
+
+output:
+  crf: 18
+  preset: slow
+# 时域平滑与羽化：两个独立的后处理，可以单独关掉
+# 详见文件顶部的说明
+temporal_enable: true
+temporal_window: 3
+feather_px: 8
