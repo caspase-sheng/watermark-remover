@@ -17,6 +17,8 @@ models/
 *.ckpt
 
 # 虚拟环境
+# env/ 是 setup_portable.bat 建的便携环境，体积几个 GB，不往仓库里放
+env/
 .conda/
 .venv/
 venv/

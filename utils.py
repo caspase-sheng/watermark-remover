@@ -43,7 +43,13 @@ TARGET_WIDTH = 1920
 TARGET_HEIGHT = 1080
 
 # 路径都基于脚本所在目录，避免因为工作目录不同找不到 input/output
-PROJECT_ROOT = Path(__file__).resolve().parent
+# 用 PyInstaller 打包成 exe 后，__file__ 指向的是临时解包目录，
+# 那样 config.yaml / models / input 都会找错地方，所以改用 exe 自己所在的目录，
+# 让这些资源继续从 exe 外面读（权重和 ffmpeg 不打进包里）
+if getattr(sys, "frozen", False):
+    PROJECT_ROOT = Path(sys.executable).resolve().parent
+else:
+    PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_INPUT_DIR = PROJECT_ROOT / "input"
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "output"
 DEFAULT_CONFIG_PATH = PROJECT_ROOT / "config.yaml"
@@ -57,6 +63,8 @@ DEFAULT_CONFIG: Dict = {
         "device": "auto",    # auto / cuda / cpu
         "padding": 20,       # ROI 在水印框基础上向外扩的像素数
         "mask_dilate": 4,    # 掩码膨胀像素，用来盖住水印边缘的抗锯齿
+        # LaMa 一次打包几张 ROI 一起推理。0=按显存自动，1=逐帧（老路子，最省显存）
+        "lama_batch_size": 0,
     },
     # 修复方式：sttn（整段一起修，背景变化时更自然，慢）/ lama（逐帧，快）/ opencv（降级）
     "inpaint_method": "lama",
@@ -71,7 +79,7 @@ DEFAULT_CONFIG: Dict = {
     },
     "output": {
         "crf": 18,
-        "preset": "slow",
+        "preset": "medium",
     },
     # 逐帧修复的结果在相邻帧之间会有轻微跳动，背景一变就看着像闪烁。
     # 打开时间轴平滑后，会把每帧的 ROI 沿时间轴做一次中值滤波压掉波动。
@@ -468,9 +476,9 @@ def _encode_with_ffmpeg(frames, target_path: str, width: int, height: int,
 
 
 def write_video_ffmpeg(frames, output_path, fps, width, height,
-                       crf: int = 18, preset: str = "slow") -> Path:
+                       crf: int = 18, preset: str = "medium") -> Path:
     """
-    把帧序列写成 H.264 无声视频（libx264 / CRF 18 / preset slow / yuv420p / 无音频）。
+    把帧序列写成 H.264 无声视频（libx264 / CRF 18 / yuv420p / 无音频）。
 
     参数：
         frames      : 可迭代对象，逐帧产出 BGR 的 numpy 数组

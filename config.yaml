@@ -18,6 +18,10 @@
 #   padding     —— ROI 在水印框基础上往外扩的像素，推荐 20。显存不够就调小（如 8）
 #   mask_dilate —— 掩码膨胀像素，用来吃掉水印边缘的抗锯齿，推荐 4；
 #                  水印外圈剩白边就调到 10~14
+#   lama_batch_size —— LaMa 一次打包几张 ROI 一起推理，只对 lama 有效
+#                  0（默认）—— 按显存自动定：8G 卡给 8，6G 给 6，4G 给 4，再小给 2
+#                  1        —— 逐帧修（老路子），最省显存但慢好几倍
+#                  想手动压一下显存峰值可以填 2~4；显存不足会自动减半重试
 #
 # sttn（inpaint_method: sttn 时生效）：
 #   segment_size      —— 一次送进网络的帧数，推荐 10（5~10 都行）。越大参考的时间信息越多，
@@ -31,7 +35,8 @@
 #
 # output：
 #   crf    —— H.264 质量，推荐 18（数字越小画质越好、文件越大）
-#   preset —— 编码速度档位，推荐 slow。想快点出结果可以改 medium
+#   preset —— 编码速度档位，推荐 medium（和 slow 同画质，快一倍多，文件大约 3%）。
+#             想要最小体积可以改 slow，想更快改 fast
 #
 # 后处理（两个独立开关，可以各自关掉）：
 #   temporal_enable —— 修复结果沿时间轴做中值滤波，压掉帧间闪烁，推荐 true
@@ -50,6 +55,8 @@ inpaint:
   device: auto
   padding: 20
   mask_dilate: 4
+  # 0 = 按显存自动（8G 给 8）；1 = 逐帧修，最省显存最慢
+  lama_batch_size: 0
 
 # STTN 相关参数（inpaint_method: sttn 时生效）
 # 各参数的作用和推荐值都写在文件顶部，这里只列出来方便对照修改
@@ -62,7 +69,7 @@ sttn:
 
 output:
   crf: 18
-  preset: slow
+  preset: medium
 # 时域平滑与羽化：两个独立的后处理，可以单独关掉
 # 详见文件顶部的说明
 temporal_enable: true

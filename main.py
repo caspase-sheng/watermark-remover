@@ -18,7 +18,7 @@ from __future__ import annotations
 import sys
 import time
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
 
 from tqdm import tqdm
 
@@ -38,6 +38,10 @@ except Exception:
 Region = Tuple[int, int, int, int]
 
 
+class ProcessingCancelled(Exception):
+    """Web 界面上点了「取消」。命令行用不到这个异常，正常流程不会抛。"""
+
+
 def print_env_info() -> None:
     """打印一下 PyTorch / GPU 情况，方便排查环境问题。"""
     try:
@@ -51,7 +55,8 @@ def print_env_info() -> None:
 
 def process_one_video(video_path: Path, output_dir: Path, engine: InpaintEngine,
                       region: Region, ref_size: Tuple[int, int], output_cfg: Dict,
-                      temporal_cfg: Dict) -> Path:
+                      temporal_cfg: Dict, progress_cb=None, cancel_check=None,
+                      stage_times: Optional[Dict[str, float]] = None) -> Path:
     """
     处理单个视频，返回输出文件路径。
 
@@ -68,8 +73,26 @@ def process_one_video(video_path: Path, output_dir: Path, engine: InpaintEngine,
 
     代价是要把整个视频的帧缓存在内存里（1080p 大约每 100 帧 0.6GB）。
     视频都很短的话没问题，遇到几万帧的长视频就得再想办法分块处理了。
+
+    两个可选回调是给 Web 界面用的，命令行不传、行为和以前完全一样：
+        progress_cb(phase, done, total)：phase 是 read / repair / write，
+            每读完或编码完一帧调一次，用来刷前端进度条；
+        cancel_check()：用户点了取消时抛出 ProcessingCancelled，
+            写了一半的输出文件会被下面的 except 清掉。
+
+    stage_times 传一个 dict 进来，会把各阶段的耗时（秒）填进去，
+    Web 界面拿它在汇总表里显示「读帧 / 修复 / 平滑 / 编码」各花了多久。
+    命令行不传，行为和以前一样。
     """
     output_path = output_dir / (video_path.stem + ".mp4")
+    timings: Dict[str, float] = {} if stage_times is None else stage_times
+    _stage = time.perf_counter()
+
+    def mark(name: str) -> None:
+        nonlocal _stage
+        now = time.perf_counter()
+        timings[name] = timings.get(name, 0.0) + (now - _stage)
+        _stage = now
 
     reader = VideoReader(video_path)
     try:
@@ -108,12 +131,22 @@ def process_one_video(video_path: Path, output_dir: Path, engine: InpaintEngine,
             x0, y0, x1, y1 = patch_box
             patches.append(frame[y0:y1, x0:x1])
             frames.append(frame)
+            if progress_cb is not None:
+                progress_cb("read", len(frames), total)
+            if cancel_check is not None:
+                cancel_check()
 
         if not frames:
             raise RuntimeError("没有从视频里读到任何帧")
+        mark("读帧裁切")
 
         # --- 第二步：交给修复后端 ---
+        if progress_cb is not None:
+            progress_cb("repair", 0, len(frames))
+        if cancel_check is not None:
+            cancel_check()
         fixed = engine.repair_patches(patches, video_region, patch_box, paste_box)
+        mark("模型修复")
         # patch 都是原帧的切片，repair 用的新数组已经出来了，这里可以早点放掉
         del patches
 
@@ -124,12 +157,17 @@ def process_one_video(video_path: Path, output_dir: Path, engine: InpaintEngine,
                 fixed = temporal_smooth(fixed, window=window, method="median")
                 print("    [信息] 已对 %d 帧的修复结果做时间轴中值平滑（window=%d）"
                       % (len(frames), window))
+        mark("时间轴平滑")
 
         # --- 第四步：贴回 + 编码 ---
         # 贴回是就地修改，frames 里的数组直接被改掉，省一份内存
         def _patched_frames():
             for i in range(len(frames)):
+                if cancel_check is not None:
+                    cancel_check()
                 yield engine.paste_patch(frames[i], fixed[i], paste_box)
+                if progress_cb is not None:
+                    progress_cb("write", i + 1, len(frames))
 
         write_bar = tqdm(_patched_frames(),
                          total=len(frames),
@@ -145,8 +183,9 @@ def process_one_video(video_path: Path, output_dir: Path, engine: InpaintEngine,
             width=reader.width,
             height=reader.height,
             crf=output_cfg.get("crf", 18),
-            preset=output_cfg.get("preset", "slow"),
+            preset=output_cfg.get("preset", "medium"),
         )
+        mark("贴回编码")
         return output_path
 
     except BaseException:
@@ -219,6 +258,7 @@ def main() -> int:
     else:
         print("[信息] 时间轴平滑：关闭")
     print("[信息] 贴回羽化：%d 像素" % feather_px)
+    batch_cfg = int(inpaint_cfg.get("lama_batch_size", 0))
 
     # 模型只加载一次，整个批量过程复用
     try:
@@ -229,6 +269,7 @@ def main() -> int:
             mask_dilate=int(inpaint_cfg.get("mask_dilate", 4)),
             feather_px=feather_px,
             sttn_cfg=sttn_cfg,
+            lama_batch_size=batch_cfg,
         )
     except ImportError as err:
         print("[错误] 修复后端加载失败：%s" % err)

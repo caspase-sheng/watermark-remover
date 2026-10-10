@@ -24,11 +24,14 @@
 from __future__ import annotations
 
 import math
+import os
 import sys
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import cv2
 import numpy as np
+
+from utils import PROJECT_ROOT
 
 try:
     sys.stdout.reconfigure(encoding="utf-8")
@@ -83,11 +86,18 @@ class InpaintEngine:
 
     def __init__(self, method: str = "lama", device: str = "auto",
                  padding: int = 20, mask_dilate: int = 4, feather_px: int = 0,
-                 sttn_cfg: dict = None):
+                 sttn_cfg: dict = None, lama_batch_size: int = 0):
         self.method = (method or "lama").strip().lower()
         self.padding = max(0, int(padding))
         self.mask_dilate = max(0, int(mask_dilate))
         self.feather_px = max(0, int(feather_px))
+
+        # LaMa 一次喂几张 ROI。0 表示按显存自动定，1 表示逐帧（老路子）。
+        # 逐帧调用每次都要等 GPU 同步、来回搬 PIL，GPU 大部分时间闲着，
+        # 打包成一批送进去能快好几倍，见 _lama_repair_batch。
+        self.lama_batch_size = max(0, int(lama_batch_size or 0))
+        # 自动模式下算出来的批大小，跑完第一个视频就固定下来复用
+        self._batch_eff = None
 
         self.device = None
         self._lama = None
@@ -116,6 +126,17 @@ class InpaintEngine:
             print("[信息] 正在加载 LaMa 模型到 GPU：%s" % torch.cuda.get_device_name(0))
         else:
             print("[信息] 正在加载 LaMa 模型到 CPU（速度会明显慢一些）")
+
+        # simple-lama-inpainting 找权重的时候先看环境变量 LAMA_MODEL，设了就直接用这个文件，
+        # 没设才去 torch hub 缓存里找（缓存没有还会联网下 196MB）。
+        # 项目 models/ 下本来就放了一份，所以这里优先指过去，省得依赖外面的缓存。
+        local_weight = PROJECT_ROOT / "models" / "big-lama.pt"
+        if local_weight.exists():
+            os.environ.setdefault("LAMA_MODEL", str(local_weight))
+            print("[信息] LaMa 权重路径：%s" % local_weight)
+        else:
+            print("[信息] 未找到 %s，回退到 torch hub 缓存。"
+                  % (PROJECT_ROOT / "models" / "big-lama.pt"))
 
         try:
             self._lama = SimpleLama(device=self.device)
@@ -211,13 +232,22 @@ class InpaintEngine:
             return self._sttn_repair(patches, region, patch_box, paste_box)
 
         x, y, w, h = (int(v) for v in region)
+        geom = (patch_box[0], patch_box[1], x, y, w, h)
+
+        # LaMa 逐帧是"一张一张独立修"的，帧和帧之间没有依赖，
+        # 所以可以打包成一批一次算完，结果和逐帧一模一样（见 _lama_repair_batch）。
+        # 只有尺寸全一致才敢打包；尺寸不齐或者显存不够会自动落回下面的逐帧循环。
+        if self.method == "lama" and len({p.shape for p in patches}) == 1:
+            batched = self._lama_repair_batch(patches, geom)
+            if batched is not None:
+                return batched
+
         out = []
         for patch in patches:
             if patch.shape[0] < 2 or patch.shape[1] < 2:
                 out.append(patch)
                 continue
-            mask = self._build_mask(patch.shape[0], patch.shape[1],
-                                    (patch_box[0], patch_box[1], x, y, w, h))
+            mask = self._build_mask(patch.shape[0], patch.shape[1], geom)
             out.append(self._inpaint_roi(patch, mask))
         return out
 
@@ -432,3 +462,121 @@ class InpaintEngine:
                 arr = cv2.resize(arr, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
 
         return cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+
+    # -- 批量推理 ----------------------------------------------------------
+    #
+    # 逐帧调 LaMa 的时候，每次调用都要等一次 GPU 同步，还要在 numpy / PIL / tensor
+    # 之间来回搬，真正在算的时间只占一小部分。243 帧实测要 6 秒多，几乎全是等出来的。
+    # 把若干帧打包成一批送进去，同样的计算量两秒左右就能跑完，结果完全一样。
+
+    def _resolve_batch_size(self, patch_h: int, patch_w: int) -> int:
+        """这批图一次喂几张。配置里写死了就用配置，写 0 就按显存估一个。"""
+        if self.lama_batch_size > 0:
+            return self.lama_batch_size
+        if self._batch_eff is None:
+            self._batch_eff = self._auto_lama_batch_size(patch_h, patch_w)
+        return self._batch_eff
+
+    def _auto_lama_batch_size(self, patch_h: int, patch_w: int) -> int:
+        """
+        按显存粗估批大小。
+
+        LaMa 的中间激活不好精确算，就按"单张输入张量字节数 × 12"折算每张的显存开销，
+        再拿总显存的四分之一做预算。宁可估小一点，真不够还有 OOM 减半兜底。
+        """
+        if self.device is None or self.device.type != "cuda":
+            # CPU 上批量省的是 Python 开销，收益有限，别开太大
+            return 4
+
+        import torch
+
+        total = int(torch.cuda.get_device_properties(0).total_memory)
+        gb = total / float(1024 ** 3)
+        # 8G 卡实际只报 7.99G，阈值别卡在整数上，否则掉一档
+        if gb >= 12:
+            cap = 16
+        elif gb >= 7.5:
+            cap = 8
+        elif gb >= 5.5:
+            cap = 6
+        elif gb >= 3.5:
+            cap = 4
+        else:
+            cap = 2
+
+        per_sample = 3 * max(1, patch_h) * max(1, patch_w) * 4 * 12
+        budget = int(total * 0.25)
+        return max(1, min(cap, max(1, budget // per_sample)))
+
+    def _lama_repair_batch(self, patches: List[np.ndarray],
+                           geom: Tuple[int, int, int, int, int, int]) -> Optional[List[np.ndarray]]:
+        """
+        把一批同样大小的 ROI 打包一次性送进 LaMa，返回修好的列表。
+
+        做的和逐帧的 _lama_roi 是同一件事：BGR 转 RGB、归一化、只往右往下补齐到
+        8 的倍数、过一次模型、裁回原尺寸、再转回 BGR。唯一区别是批大小从 1 变成 N，
+        模型参数和掩码都没变，所以输出和逐帧跑是一样的（只有浮点上的极小差异）。
+
+        显存不够就把批大小减半重试；减到 1 直接返回 None，让调用方走逐帧老路。
+        """
+        h, w = patches[0].shape[:2]
+        if h < 2 or w < 2:
+            return None
+
+        bs = self._resolve_batch_size(h, w)
+        if bs <= 1:
+            return None
+
+        # simple-lama-inpainting 只往右、往下 pad 到 8 的倍数，这里保持一致
+        mod = 8
+        oh = (h + mod - 1) // mod * mod
+        ow = (w + mod - 1) // mod * mod
+
+        # 同一个视频里水印位置固定，整批共用一张掩码，只算一次
+        mask = self._build_mask(h, w, geom)
+        mask_pad = np.pad((mask > 0).astype(np.float32),
+                          ((0, oh - h), (0, ow - w)), mode="symmetric")
+
+        out: List[np.ndarray] = []
+        i = 0
+        while i < len(patches):
+            chunk = patches[i:i + bs]
+            try:
+                out.extend(self._lama_batch_call(chunk, mask_pad, h, w, oh, ow))
+            except Exception as err:
+                if (_is_out_of_memory(err) and bs > 1
+                        and self.device is not None and self.device.type == "cuda"):
+                    import torch
+                    torch.cuda.empty_cache()
+                    bs = max(1, bs // 2)
+                    print("[警告] LaMa 批量推理显存不足，批大小降到 %d 后重试。" % bs)
+                    if bs == 1:
+                        return None
+                    continue
+                raise
+            i += len(chunk)
+
+        # 记住这次实际跑通的批大小，后面几个视频直接复用
+        self._batch_eff = bs
+        return out
+
+    def _lama_batch_call(self, chunk: List[np.ndarray], mask_pad: np.ndarray,
+                         h: int, w: int, oh: int, ow: int) -> List[np.ndarray]:
+        """打包一小批，只调一次模型。"""
+        import torch
+
+        # BGR HWC -> RGB CHW，再除以 255，和 _lama_roi 里 PIL 那条路走出来的一致
+        batch = np.stack([np.transpose(p[:, :, ::-1], (2, 0, 1)).astype(np.float32) / 255.0
+                          for p in chunk], axis=0)
+        batch = np.pad(batch, ((0, 0), (0, 0), (0, oh - h), (0, ow - w)), mode="symmetric")
+
+        images = torch.from_numpy(np.ascontiguousarray(batch)).to(self.device)
+        masks = torch.from_numpy(np.ascontiguousarray(
+            np.repeat(mask_pad[None, None], len(chunk), axis=0))).to(self.device)
+
+        with torch.inference_mode():
+            res = self._lama.model(images, masks)
+            arr = res.permute(0, 2, 3, 1).detach().cpu().numpy()
+
+        arr = np.clip(arr * 255.0, 0, 255).astype(np.uint8)[:, :h, :w]
+        return [np.ascontiguousarray(a[:, :, ::-1]) for a in arr]
