@@ -163,24 +163,41 @@ def frame_to_data_url(frame_bgr: np.ndarray, max_side: int = MAX_FRAME_SIDE) -> 
 # 顺带把 undo/redo 那个命令栈也搞废了；而且它工具栏里根本没有矩形工具。
 # 所以干脆自己用 HTML + JS 画一个：一张 <img> 铺第一帧，上面盖一个绝对定位的
 # <div> 当矩形框，鼠标按住拖动改它的 left/top/width/height。
-# 框选结果按缩放比换算回原分辨率，塞进隐藏的 #wmr-region-json 那个 Textbox，
+#
+# 缩放/平移也在这里实现：.wmr-stage 是有裁剪的视口，.wmr-view 做
+# translate + scale 变换，图片和矩形框都在 view 里，所以放大后框会跟着一起放大。
+# 框选坐标始终记在「未缩放的图像像素」里，滚轮/拖拽只改显示，不动逻辑坐标。
+# 框选结果按显示尺寸换算回原分辨率，塞进隐藏的 #wmr-region-json 那个 Textbox，
 # 再当成普通输入传给 run_process。
 #
 # 注意：gr.HTML 里的 <script> 不会执行（Gradio 用的是 {@html} 插值），
 # 所以交互逻辑统一挂在 Blocks(head=CUSTOM_HEAD) 上，用轮询去发现画布元素。
+#
+# 占位符写成 __SRC__ 这种形式，最后用 str.replace 拼。不能用 % 或 str.format：
+# 这段 HTML 里有 CSS 的 100%，% 格式化会把它当成占位符直接报错
+# （TypeError: not enough arguments for format string）；而 CSS 的大括号会让
+# str.format 炸掉。只有显式字符串替换对任何字符都零冲突。
 CANVAS_HTML = """
 <div class="wmr-picker">
   <div class="wmr-stage" id="wmr-stage">
-    <img id="wmr-frame" class="wmr-frame" src="%(src)s" data-ow="%(ow)d"
-         data-oh="%(oh)d" data-tok="%(tok)s" alt="第一帧" draggable="false">
-    <div id="wmr-rect" class="wmr-rect"></div>
+    <div class="wmr-view" id="wmr-view">
+      <img id="wmr-frame" class="wmr-frame" src="__SRC__" data-ow="__OW__"
+           data-oh="__OH__" data-tok="__TOK__" alt="第一帧" draggable="false">
+      <div id="wmr-rect" class="wmr-rect"></div>
+    </div>
   </div>
   <div class="wmr-tools">
     <button type="button" class="wmr-btn" data-wmr="undo">撤销</button>
     <button type="button" class="wmr-btn" data-wmr="redo">重做</button>
     <button type="button" class="wmr-btn" data-wmr="clear">清除</button>
+    <span class="wmr-sep"></span>
+    <button type="button" class="wmr-btn" data-wmr="zoomout" title="缩小">－</button>
+    <button type="button" class="wmr-btn" data-wmr="zoomin" title="放大">＋</button>
+    <button type="button" class="wmr-btn" data-wmr="reset" title="回到适应窗口">重置</button>
+    <span id="wmr-zoom" class="wmr-zoom">100%</span>
     <span id="wmr-readout" class="wmr-readout">在画面上按住鼠标拖动，框住水印</span>
   </div>
+  <div class="wmr-tip-line">滚轮缩放 · 空格 + 拖拽平移 · 双击重置</div>
 </div>
 """
 
@@ -193,20 +210,30 @@ CANVAS_PLACEHOLDER = """
     <button type="button" class="wmr-btn" data-wmr="undo">撤销</button>
     <button type="button" class="wmr-btn" data-wmr="redo">重做</button>
     <button type="button" class="wmr-btn" data-wmr="clear">清除</button>
+    <span class="wmr-sep"></span>
+    <button type="button" class="wmr-btn" data-wmr="zoomout" title="缩小">－</button>
+    <button type="button" class="wmr-btn" data-wmr="zoomin" title="放大">＋</button>
+    <button type="button" class="wmr-btn" data-wmr="reset" title="回到适应窗口">重置</button>
+    <span id="wmr-zoom" class="wmr-zoom">100%</span>
     <span id="wmr-readout" class="wmr-readout">等待上传视频</span>
   </div>
+  <div class="wmr-tip-line">滚轮缩放 · 空格 + 拖拽平移 · 双击重置</div>
 </div>
 """
 
 
 def build_canvas_html(frame_bgr: np.ndarray, orig_w: int, orig_h: int) -> str:
-    """把第一帧和它的原分辨率一起拼进画布 HTML。"""
-    return CANVAS_HTML % {
-        "src": frame_to_data_url(frame_bgr),
-        "ow": int(orig_w),
-        "oh": int(orig_h),
-        "tok": "%d" % int(time.time() * 1000),
-    }
+    """把第一帧和它的原分辨率一起拼进画布 HTML。
+
+    这里用 str.replace 逐个替换占位符，不用 % 也不用 str.format：
+    模板里有 CSS 的 100%，`%` 会把它当占位符报错；CSS 的大括号又会干扰
+    str.format。显式字符串替换对任何字符都安全。
+    """
+    return (CANVAS_HTML
+            .replace("__SRC__", frame_to_data_url(frame_bgr))
+            .replace("__OW__", str(int(orig_w)))
+            .replace("__OH__", str(int(orig_h)))
+            .replace("__TOK__", str(int(time.time() * 1000))))
 
 
 def parse_region(raw):
@@ -539,8 +566,8 @@ def on_cancel():
 
 
 def run_process(files, region_raw, ref, use_manual, mx, my, mw, mh,
-                method, mask_dilate, feather_px, temporal_enable, temporal_window,
-                preset, lama_batch, progress=gr.Progress()):
+                method, mask_dilate, feather_px, padding, temporal_enable,
+                temporal_window, crf, preset, lama_batch, progress=gr.Progress()):
     """批量处理。生成器：后台线程干活，这里每 0.5 秒刷一次状态面板。"""
     skip3 = (gr.skip(), gr.skip(), gr.skip())
 
@@ -557,9 +584,10 @@ def run_process(files, region_raw, ref, use_manual, mx, my, mw, mh,
 
         config = load_config(DEFAULT_CONFIG_PATH)
         inpaint_cfg = config.get("inpaint", {}) or {}
-        # 界面上选的编码速度覆盖 config.yaml 里的 output.preset
+        # 界面上选的编码速度 / 画质覆盖 config.yaml 里 output 的同名项
         output_cfg = dict(config.get("output", {}) or {})
         output_cfg["preset"] = str(preset or PRESET_DEFAULT)
+        output_cfg["crf"] = int(crf)
         sttn_cfg = config.get("sttn", {}) or {}
 
         ref_w = int((ref or {}).get("width", 0))
@@ -597,7 +625,8 @@ def run_process(files, region_raw, ref, use_manual, mx, my, mw, mh,
 
         temporal_cfg = {"enable": bool(temporal_enable), "window": int(temporal_window)}
         feather = max(0, int(feather_px))
-        padding = int(inpaint_cfg.get("padding", 20))
+        # padding 由界面传进来（默认取 config.yaml 的值），显存紧张时可以调小
+        padding = max(0, int(padding))
         device = inpaint_cfg.get("device", "auto")
 
         _CANCEL.clear()
@@ -668,14 +697,16 @@ _GITHUB_ICON = ('<svg width="15" height="15" viewBox="0 0 16 16" fill="currentCo
                 '.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38'
                 'A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>')
 
-HEADER_HTML = """
+HEADER_HTML = ("""
 <div id="wmr-header">
   <h1>视频固定位置水印去除</h1>
   <p class="wmr-sub">框住水印 → 选修复方式 → 批量处理。输出保持原分辨率、H.264 CRF 18、无音频。</p>
-  <a class="wmr-gh" href="%s" target="_blank" rel="noopener">%s GitHub 仓库</a>
+  <a class="wmr-gh" href="__GH_URL__" target="_blank" rel="noopener">__GH_ICON__ GitHub 仓库</a>
   <div class="wmr-divider"></div>
 </div>
-""" % (GITHUB_URL, _GITHUB_ICON)
+"""
+    .replace("__GH_URL__", GITHUB_URL)
+    .replace("__GH_ICON__", _GITHUB_ICON))
 
 DISCLAIMER_HTML = """
 <div class="wmr-disclaimer">
@@ -687,7 +718,7 @@ DISCLAIMER_HTML = """
 
 CUSTOM_CSS = """
 .gradio-container {
-  max-width: 1440px !important;
+  max-width: 1140px !important;
   margin: 0 auto !important;
   font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
 }
@@ -798,6 +829,86 @@ CUSTOM_CSS = """
 .wmr-hint p { margin: 0; }
 .dark .wmr-hint { background: rgba(99, 102, 241, .13); }
 
+/* ---- 参数标签 + 问号解释 ---- */
+.wmr-plabel {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 12px 0 3px 0;
+  font-size: .92rem;
+  font-weight: 600;
+}
+.wmr-plabel .wmr-en {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: .76rem;
+  font-weight: 500;
+  color: var(--body-text-color-subdued);
+}
+/* 圆圈问号。悬停/聚焦才把解释气泡显示出来，平时不占地方 */
+.wmr-q {
+  position: relative;
+  flex: none;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  border: 1px solid var(--border-color-primary);
+  background: var(--background-fill-secondary);
+  color: var(--body-text-color-subdued);
+  font-size: .68rem;
+  font-weight: 700;
+  line-height: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: help;
+  outline: none;
+  /* 问号自己带一个很高的 z-index，气泡跟着它一起浮到所有卡片之上 */
+  z-index: 9999;
+  transition: color .15s ease, border-color .15s ease;
+}
+.wmr-q:hover, .wmr-q:focus { color: #6366f1; border-color: #6366f1; }
+.wmr-tip {
+  visibility: hidden;
+  opacity: 0;
+  position: absolute;
+  left: -6px;
+  bottom: 150%;
+  width: 290px;
+  max-width: 78vw;
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid var(--border-color-primary);
+  background: var(--background-fill-primary);
+  color: var(--body-text-color);
+  font-size: .82rem;
+  font-weight: 400;
+  line-height: 1.75;
+  text-align: left;
+  white-space: normal;
+  box-shadow: 0 10px 26px rgba(15, 23, 42, .18);
+  z-index: 9999;
+  pointer-events: none;
+  transition: opacity .12s ease;
+}
+.dark .wmr-tip { box-shadow: 0 10px 26px rgba(0, 0, 0, .55); }
+.wmr-tip code {
+  background: var(--background-fill-secondary);
+  border-radius: 4px;
+  padding: 0 4px;
+  font-size: .78rem;
+}
+.wmr-q:hover .wmr-tip, .wmr-q:focus .wmr-tip { visibility: visible; opacity: 1; }
+/* 气泡不能被卡片或手风琴的内容区裁掉。
+   实测会裁的三层（按层级从外到内）：
+     .wmr-card > .styler —— 手风琴根容器，overflow: hidden
+     #wmr-params         —— 手风琴内容区，overflow: auto
+     #wmr-params .block  —— 内容区里那层 Gradio block，overflow: auto
+   之前只写了 .wrap，可 Gradio 5 这里根本不用 .wrap 这个类，所以没生效。 */
+.wmr-card,
+.wmr-card > .styler,
+#wmr-params,
+#wmr-params .block { overflow: visible !important; }
+
 /* ---- 按钮 ---- */
 #wmr-run button {
   background: linear-gradient(135deg, #6366f1, #8b5cf6) !important;
@@ -860,9 +971,11 @@ CUSTOM_CSS = """
 
 /* ---- 框选画布 ---- */
 .wmr-picker { margin: 4px 0 10px 0; }
+/* 画布是个有裁剪的视口：里面 .wmr-view 做缩放/平移，超出部分被裁掉，
+   但视口本身的高度仍由未缩放的内容撑开（transform 不影响布局）。 */
 .wmr-stage {
   position: relative;
-  display: inline-block;
+  width: 100%;
   max-width: 100%;
   line-height: 0;
   border-radius: 10px;
@@ -870,21 +983,27 @@ CUSTOM_CSS = """
   background: #0f172a;
 }
 .wmr-stage-empty {
-  display: block;
   padding: 56px 16px;
   text-align: center;
   line-height: 1.7;
   font-size: .95rem;
   color: var(--body-text-color-subdued);
 }
+.wmr-view {
+  display: block;
+  transform-origin: 0 0;
+  will-change: transform;
+}
 .wmr-frame {
   display: block;
-  max-width: 100%;
+  width: 100%;
   height: auto;
   cursor: crosshair;
   user-select: none;
   -webkit-user-drag: none;
 }
+.wmr-stage.wmr-grab, .wmr-stage.wmr-grab .wmr-frame { cursor: grab; }
+.wmr-stage.wmr-panning, .wmr-stage.wmr-panning .wmr-frame { cursor: grabbing; }
 .wmr-rect {
   position: absolute;
   display: none;
@@ -911,8 +1030,23 @@ CUSTOM_CSS = """
   transition: border-color .15s ease, color .15s ease;
 }
 .wmr-btn:hover { border-color: #6366f1; color: #6366f1; }
+.wmr-sep {
+  width: 1px;
+  height: 18px;
+  background: var(--border-color-primary);
+  margin: 0 2px;
+}
+.wmr-zoom { font-size: .8rem; font-weight: 600; color: #6366f1; min-width: 42px; }
 .wmr-readout { font-size: .875rem; color: var(--body-text-color-subdued); }
+.wmr-tip-line { margin-top: 6px; font-size: .8rem; color: var(--body-text-color-subdued); }
 #wmr-region-json { display: none !important; }
+
+/* ---- 窄屏 ---- */
+@media (max-width: 768px) {
+  #wmr-header h1 { font-size: 1.6rem; }
+  .wmr-card { padding: 12px 12px; border-radius: 12px; }
+  .wmr-tip { width: min(240px, 72vw); }
+}
 """
 
 
@@ -921,12 +1055,40 @@ CUSTOM_CSS = """
 CUSTOM_HEAD = """
 <script>
 (function () {
-  var imgEl = null, rectEl = null, readoutEl = null;
+  var stageEl = null, viewEl = null, imgEl = null, rectEl = null, readoutEl = null;
+  var zoomEl = null;
   var startPt = null, curRect = null, hist = [], hi = -1, lastTok = null;
+  // 视图变换：z 是缩放倍数，tx/ty 是相对画布视口左上角的平移像素。
+  // 框选坐标始终存在「未缩放的图像像素」里，所以缩放平移只改显示、不动逻辑坐标。
+  var z = 1, tx = 0, ty = 0, MIN_Z = 0.5, MAX_Z = 8;
+  var spaceDown = false, hoveringStage = false, panning = false, panStart = null;
 
   function boxEl() {
     return document.querySelector('#wmr-region-json textarea') ||
            document.querySelector('#wmr-region-json input');
+  }
+
+  function applyView() {
+    if (!viewEl) { return; }
+    viewEl.style.transform = 'translate(' + tx + 'px,' + ty + 'px) scale(' + z + ')';
+    if (zoomEl) { zoomEl.textContent = Math.round(z * 100) + '%'; }
+  }
+
+  function resetView() {
+    z = 1;
+    tx = 0;
+    ty = 0;
+    applyView();
+  }
+
+  // 以画布内某点为锚点缩放，保证那个点在缩放前后停在原地
+  function zoomAt(cx, cy, factor) {
+    var nz = Math.max(MIN_Z, Math.min(MAX_Z, z * factor));
+    if (Math.abs(nz - z) < 1e-4) { return; }
+    tx = cx - (cx - tx) * (nz / z);
+    ty = cy - (cy - ty) * (nz / z);
+    z = nz;
+    applyView();
   }
 
   function pushRegion() {
@@ -935,11 +1097,10 @@ CUSTOM_HEAD = """
     if (curRect && curRect.w >= 2 && curRect.h >= 2 && imgEl) {
       var ow = parseFloat(imgEl.getAttribute('data-ow')) || 0;
       var oh = parseFloat(imgEl.getAttribute('data-oh')) || 0;
-      // 这里按「显示尺寸」换算，不能用 naturalWidth：图片会被 CSS 的 max-width
-      // 缩小显示，鼠标坐标是在显示尺寸上量的，用 naturalWidth 算会偏。
-      var box = imgEl.getBoundingClientRect();
-      var nw = box.width || imgEl.naturalWidth || imgEl.width || 1;
-      var nh = box.height || imgEl.naturalHeight || imgEl.height || 1;
+      // 用 offsetWidth/offsetHeight 拿「布局尺寸」，它不受缩放 transform 影响，
+      // 正是鼠标坐标所在的那套基准；框的坐标记的也是这套基准，直接按比例换算即可。
+      var nw = imgEl.offsetWidth || imgEl.naturalWidth || imgEl.width || 1;
+      var nh = imgEl.offsetHeight || imgEl.naturalHeight || imgEl.height || 1;
       payload = JSON.stringify({
         x: Math.max(0, Math.round(curRect.x * ow / nw)),
         y: Math.max(0, Math.round(curRect.y * oh / nh)),
@@ -996,11 +1157,18 @@ CUSTOM_HEAD = """
   }
 
   function localPoint(ev) {
-    var b = imgEl.getBoundingClientRect();
-    return { x: ev.clientX - b.left, y: ev.clientY - b.top };
+    // 屏幕坐标 -> 画布视口左上角 -> 去掉平移、再除以缩放，回到未缩放的图像像素
+    var s = stageEl.getBoundingClientRect();
+    return { x: (ev.clientX - s.left - tx) / z, y: (ev.clientY - s.top - ty) / z };
   }
 
   document.addEventListener('mousemove', function (ev) {
+    if (panning && panStart) {
+      tx = panStart.tx + (ev.clientX - panStart.x);
+      ty = panStart.ty + (ev.clientY - panStart.y);
+      applyView();
+      return;
+    }
     if (!startPt || !imgEl) { return; }
     var p = localPoint(ev);
     curRect = {
@@ -1011,6 +1179,12 @@ CUSTOM_HEAD = """
   });
 
   document.addEventListener('mouseup', function (ev) {
+    if (panning) {
+      panning = false;
+      panStart = null;
+      if (stageEl) { stageEl.classList.remove('wmr-panning'); }
+      return;
+    }
     if (!startPt || !imgEl) { return; }
     var p = localPoint(ev);
     var r = {
@@ -1036,8 +1210,72 @@ CUSTOM_HEAD = """
       if (hi >= 0) { hi -= 1; restore(); }
     } else if (act === 'redo') {
       if (hi < hist.length - 1) { hi += 1; restore(); }
+    } else if (act === 'zoomin' || act === 'zoomout') {
+      // 按钮缩放以画布中心为锚点
+      var sm = stageEl ? stageEl.getBoundingClientRect()
+                       : { width: 0, height: 0 };
+      zoomAt(sm.width / 2, sm.height / 2, act === 'zoomin' ? 1.25 : 1 / 1.25);
+    } else if (act === 'reset') {
+      resetView();
     }
   });
+
+  // 空格按住 = 平移（光标变抓手）；鼠标在画布上时空格不滚页面
+  document.addEventListener('keydown', function (ev) {
+    if (ev.code === 'Space' || ev.key === ' ') {
+      if (hoveringStage && !spaceDown) { ev.preventDefault(); }
+      spaceDown = true;
+      if (stageEl) { stageEl.classList.add('wmr-grab'); }
+    }
+  });
+  document.addEventListener('keyup', function (ev) {
+    if (ev.code === 'Space' || ev.key === ' ') {
+      spaceDown = false;
+      if (stageEl && !panning) { stageEl.classList.remove('wmr-grab'); }
+    }
+  });
+  // 切走窗口时把空格状态清掉，免得回来一直是抓手
+  window.addEventListener('blur', function () {
+    spaceDown = false;
+    if (stageEl && !panning) { stageEl.classList.remove('wmr-grab'); }
+  });
+
+  // 上传新视频后整块 HTML 会被替换成新元素，所以每次发现新画布都要重新挂一遍交互
+  function attach() {
+    imgEl.addEventListener('mousedown', function (ev) {
+      // 左键拖 = 画框；按着空格或中键时交给下面的平移逻辑
+      if (ev.button !== 0 || spaceDown) { return; }
+      ev.preventDefault();
+      startPt = localPoint(ev);
+      curRect = { x: startPt.x, y: startPt.y, w: 0, h: 0 };
+      drawRect();
+    });
+
+    // 平移：中键拖，或者按住空格再用左键拖
+    stageEl.addEventListener('mousedown', function (ev) {
+      var wantPan = (ev.button === 1) || (ev.button === 0 && spaceDown);
+      if (!wantPan) { return; }
+      ev.preventDefault();
+      panning = true;
+      panStart = { x: ev.clientX, y: ev.clientY, tx: tx, ty: ty };
+      stageEl.classList.add('wmr-panning');
+    });
+
+    // 滚轮缩放，以鼠标位置为锚点
+    stageEl.addEventListener('wheel', function (ev) {
+      ev.preventDefault();
+      var s = stageEl.getBoundingClientRect();
+      zoomAt(ev.clientX - s.left, ev.clientY - s.top, ev.deltaY < 0 ? 1.15 : 1 / 1.15);
+    }, { passive: false });
+
+    stageEl.addEventListener('dblclick', function (ev) {
+      ev.preventDefault();
+      resetView();
+    });
+
+    stageEl.addEventListener('mouseenter', function () { hoveringStage = true; });
+    stageEl.addEventListener('mouseleave', function () { hoveringStage = false; });
+  }
 
   setInterval(function () {
     var im = document.getElementById('wmr-frame');
@@ -1047,19 +1285,19 @@ CUSTOM_HEAD = """
     if (!src || tok === lastTok) { return; }
     lastTok = tok;
     imgEl = im;
+    stageEl = document.getElementById('wmr-stage');
+    viewEl = document.getElementById('wmr-view');
     rectEl = document.getElementById('wmr-rect');
     readoutEl = document.getElementById('wmr-readout');
+    zoomEl = document.getElementById('wmr-zoom');
     hist = [];
     hi = -1;
     startPt = null;
     curRect = null;
-    im.addEventListener('mousedown', function (ev) {
-      if (ev.button !== 0) { return; }
-      ev.preventDefault();
-      startPt = localPoint(ev);
-      curRect = { x: startPt.x, y: startPt.y, w: 0, h: 0 };
-      drawRect();
-    });
+    panning = false;
+    panStart = null;
+    resetView();
+    if (stageEl && viewEl) { attach(); }
     drawRect();
     pushRegion();
   }, 250);
@@ -1068,10 +1306,67 @@ CUSTOM_HEAD = """
 """
 
 
+# 参数解释文案。鼠标悬停在问号上时弹出。
+_TIP_METHOD = ("<b>修复方式</b> <code>inpaint_method</code><br>"
+               "用哪个后端修水印。<b>lama</b>：逐帧修，快，动画/插画风、"
+               "背景变化小的够用。<b>sttn</b>：把附近一段帧当整体修，"
+               "实拍、纹理丰富、背景在动时更自然，但要慢不少。<br>"
+               "取值 lama / sttn。拿不准就先跑 lama，觉得水印那块发糊再换 sttn 比一下。")
+
+_TIP_MASK = ("<b>掩码膨胀</b> <code>mask_dilate</code><br>"
+             "修复时把水印边缘的抗锯齿、描边一起盖住多少像素。<br>"
+             "范围 0~20，默认 4。水印去掉了但外圈还剩一圈白边，就调到 10~14。")
+
+_TIP_BATCH = ("<b>LaMa 批大小</b> <code>lama_batch_size</code><br>"
+              "一次打包几张 ROI 送进 LaMa，只对 lama 有效。逐帧调用每次都要等 GPU 同步，"
+              "打包能快好几倍，打包到 8 张左右收益就差不多到顶了。<br>"
+              "默认「自动」（按显存定，8G 卡落 8）。显存不够会自动减半重试；填 1 退回逐帧。")
+
+_TIP_FEATHER = ("<b>边缘羽化</b> <code>feather_px</code><br>"
+                "修复结果贴回画面时，边缘留多宽的渐变带过渡到原画面。<br>"
+                "范围 0~32，默认 8。越大过渡越柔和（太大可能把周围画面也带糊），0 表示不羽化。")
+
+_TIP_PADDING = ("<b>ROI 外扩</b> <code>padding</code><br>"
+                "送进模型的那块图比水印框再往外扩多少像素，给模型一点周围上下文。<br>"
+                "范围 0~64，默认 20。它决定送进模型的图多大，显存紧张就调小（比如 8）。")
+
+_TIP_TEMPORAL = ("<b>时间轴平滑</b> <code>temporal_enable</code><br>"
+                 "沿时间轴对修复结果做一次中值滤波，压掉相邻帧之间的抖动/闪烁。<br>"
+                 "默认开。修复区一闪一闪的时候打开；想要最贴近逐帧原始结果可以关掉。")
+
+_TIP_WINDOW = ("<b>平滑窗口</b> <code>temporal_window</code><br>"
+               "时间平滑的窗口帧数，只取奇数，范围 1~9。<br>"
+               "默认 3，越大越稳；但快速运动时窗口太大会留下轻微拖影，1 等于不平滑。")
+
+_TIP_CRF = ("<b>输出画质</b> <code>crf</code><br>"
+            "H.264 的质量档，越小画质越好、文件越大。<br>"
+            "范围 14~28，默认 18。想再省体积可以调到 20 上下；一般不建议动。")
+
+_TIP_PRESET = ("<b>编码速度</b> <code>preset</code><br>"
+               "x264 的编码档位，CRF 不变时画质基本一样，只影响编码花的时间和文件大小。<br>"
+               "slow 质量最好最慢，medium 平衡（默认），fast 最快、文件稍大。")
+
+
+def _param_label(zh: str, en: str, tip: str) -> str:
+    """参数标签行：中文名 + 英文键名 + 圆圈问号（悬停出解释气泡）。
+
+    同样用 str.replace 拼，和画布模板保持一致，免得以后往文案里加个百分号
+    又被 % 格式化当成占位符。
+    """
+    return ('<div class="wmr-plabel"><span>__ZH__</span>'
+            '<span class="wmr-en">__EN__</span>'
+            '<span class="wmr-q" tabindex="0">?<span class="wmr-tip">__TIP__</span></span>'
+            '</div>'
+            .replace("__ZH__", html.escape(zh))
+            .replace("__EN__", html.escape(en))
+            .replace("__TIP__", tip))
+
+
 def build_ui() -> gr.Blocks:
     """搭界面。默认值都从 config.yaml 读，保证和命令行版本一致。"""
     config = load_config(DEFAULT_CONFIG_PATH)
     inpaint_cfg = config.get("inpaint", {}) or {}
+    output_cfg = config.get("output", {}) or {}
 
     default_method = str(config.get("inpaint_method", "lama")).strip().lower()
     if default_method not in ("lama", "sttn"):
@@ -1081,10 +1376,13 @@ def build_ui() -> gr.Blocks:
     default_temporal = bool(config.get("temporal_enable", True))
     default_window = int(config.get("temporal_window", 3))
     default_lama_batch = max(0, int(inpaint_cfg.get("lama_batch_size", 0)))
+    default_padding = int(inpaint_cfg.get("padding", 20))
+    default_crf = int(output_cfg.get("crf", 18))
 
     theme = gr.themes.Soft(primary_hue="indigo", secondary_hue="violet",
                            neutral_hue="slate", radius_size="lg", spacing_size="lg")
 
+    # 整页单列：从上到下一条主线，卡片依次堆叠，内容由 CSS 限制宽度并居中。
     with gr.Blocks(theme=theme, css=CUSTOM_CSS, head=CUSTOM_HEAD,
                    title="视频固定位置水印去除") as demo:
         gr.HTML(HEADER_HTML)
@@ -1092,108 +1390,104 @@ def build_ui() -> gr.Blocks:
 
         ref_state = gr.State({})
 
-        with gr.Row():
-            # ---- 左列：上传 + 框选 ----
-            with gr.Column(scale=3):
-                with gr.Group(elem_classes="wmr-card"):
-                    gr.HTML('<div class="wmr-card-title"><span class="wmr-step">1</span>'
-                            '上传视频</div>')
-                    files = gr.File(label="拖进来或点一下选择（可多选，仅 .mp4）",
-                                    file_count="multiple", file_types=[".mp4"])
+        # ---- 第一步：上传视频 ----
+        with gr.Group(elem_classes="wmr-card"):
+            gr.HTML('<div class="wmr-card-title"><span class="wmr-step">1</span>'
+                    '上传视频</div>')
+            files = gr.File(label="拖进来或点一下选择（可多选，仅 .mp4）",
+                            file_count="multiple", file_types=[".mp4"])
 
-                with gr.Group(elem_classes="wmr-card"):
-                    gr.HTML('<div class="wmr-card-title"><span class="wmr-step">2</span>'
-                            '框选水印</div>')
-                    gr.Markdown(
-                        "在下面的画面上**按住鼠标拖一个矩形**，把水印整个框住。"
-                        "框的时候比水印**大一圈**，把外面的白边/描边也一起带进去，"
-                        "不然文字去掉了框还在。拖歪了用画布下面的「撤销 / 重做 / 清除」调。",
+        # ---- 第二步：第一帧预览 + 框选 ----
+        with gr.Group(elem_classes="wmr-card"):
+            gr.HTML('<div class="wmr-card-title"><span class="wmr-step">2</span>'
+                    '框选水印</div>')
+            gr.Markdown(
+                "上传后这里会铺上第一个视频的第一帧。在画面上**按住鼠标拖一个矩形**，"
+                "把水印整个框住。框的时候比水印**大一圈**，把外面的白边/描边也一起带进去，"
+                "不然文字去掉了框还在。水印小不好框就先滚轮放大，再按住空格拖拽挪画面。",
+                elem_classes="wmr-hint")
+            canvas = gr.HTML(value=CANVAS_PLACEHOLDER)
+            region_json = gr.Textbox(value="", elem_id="wmr-region-json")
+            with gr.Accordion("不想拖框？直接手填坐标", open=False):
+                use_manual = gr.Checkbox(
+                    value=False, label="改用手动坐标（忽略上面的框选）",
+                    info="勾上后按第一个视频的原分辨率填 x/y/w/h；"
+                         "批量处理时会自动等比换算到其它分辨率的视频")
+                with gr.Row():
+                    mx = gr.Number(label="x", value=0, precision=0)
+                    my = gr.Number(label="y", value=0, precision=0)
+                    mw = gr.Number(label="w", value=0, precision=0)
+                    mh = gr.Number(label="h", value=0, precision=0)
+
+        # ---- 第三步：参数（默认收起） ----
+        with gr.Group(elem_classes="wmr-card"):
+            gr.HTML('<div class="wmr-card-title"><span class="wmr-step">3</span>'
+                    '修复参数</div>')
+            gr.Markdown("每个参数后面那个 **?** 悬停（或键盘聚焦）会弹出解释。"
+                        "默认值和 `config.yaml` 一致，一般不用动。",
                         elem_classes="wmr-hint")
-                    canvas = gr.HTML(value=CANVAS_PLACEHOLDER)
-                    region_json = gr.Textbox(value="", elem_id="wmr-region-json")
-                    with gr.Accordion("不想拖框？直接手填坐标", open=False):
-                        use_manual = gr.Checkbox(
-                            value=False, label="改用手动坐标（忽略上面的框选）",
-                            info="勾上后按第一个视频的原分辨率填 x/y/w/h；"
-                                 "批量处理时会自动等比换算到其它分辨率的视频")
-                        with gr.Row():
-                            mx = gr.Number(label="x", value=0, precision=0)
-                            my = gr.Number(label="y", value=0, precision=0)
-                            mw = gr.Number(label="w", value=0, precision=0)
-                            mh = gr.Number(label="h", value=0, precision=0)
+            with gr.Accordion("展开修改参数", open=False, elem_id="wmr-params"):
+                gr.HTML(_param_label("修复方式", "inpaint_method", _TIP_METHOD))
+                method = gr.Dropdown(choices=["lama", "sttn"], value=default_method,
+                                     show_label=False)
 
-            # ---- 右列：参数 + 处理 + 结果 ----
-            with gr.Column(scale=2):
-                with gr.Group(elem_classes="wmr-card"):
-                    gr.HTML('<div class="wmr-card-title"><span class="wmr-step">3</span>'
-                            '修复参数</div>')
-                    with gr.Accordion("展开修改（默认值和 config.yaml 一致，一般不用动）",
-                                      open=False):
-                        method = gr.Dropdown(
-                            choices=["lama", "sttn"], value=default_method,
-                            label="修复方式 inpaint_method",
-                            info="lama：逐帧修，快，动画/插画风够用；"
-                                 "sttn：整段一起修，实拍、背景在动时更自然，慢一些")
-                        mask_dilate = gr.Slider(
-                            0, 20, value=default_mask_dilate, step=1,
-                            label="掩码膨胀 mask_dilate",
-                            info="把水印边缘抗锯齿一起盖住的像素数，默认 4；"
-                                 "水印外圈有白边残留就调大")
-                        lama_batch = gr.Dropdown(
-                            choices=[("自动（按显存）", 0), ("1（逐帧，最省显存）", 1),
-                                     ("2", 2), ("4", 4), ("8", 8), ("16", 16)],
-                            value=default_lama_batch,
-                            label="LaMa 批大小 lama_batch_size",
-                            info="一次打包几张 ROI 送进模型，只对 lama 有效。"
-                                 "逐帧调用每次都要等 GPU 同步，实测 243 帧要十几秒；"
-                                 "打包成 8 张只要 2 秒多。填 1 回到逐帧老路子。"
-                                 "显存不足会自动减半重试。")
-                        feather_px = gr.Slider(
-                            0, 32, value=default_feather, step=1,
-                            label="边缘羽化 feather_px",
-                            info="贴回时边缘过渡的像素数，默认 8；0 表示不羽化")
-                        temporal_enable = gr.Checkbox(
-                            value=default_temporal,
-                            label="时间轴平滑 temporal_enable",
-                            info="沿时间轴做中值滤波，压掉修复区域的帧间闪烁")
-                        temporal_window = gr.Slider(
-                            1, 9, value=default_window, step=2,
-                            label="平滑窗口 temporal_window",
-                            info="只取奇数帧，3 或 5 够用；1 等于不平滑")
-                        preset = gr.Dropdown(
-                            choices=PRESET_CHOICES, value=PRESET_DEFAULT,
-                            label="编码速度 preset",
-                            info="开了 LaMa 批量推理之后，编码成了最大的一块（约占四成）。"
-                                 "slow 最省体积但最慢，medium 快一倍多，fast 更快、"
-                                 "文件稍大。CRF 固定 18，画质基本不受影响。")
+                gr.HTML(_param_label("掩码膨胀", "mask_dilate", _TIP_MASK))
+                mask_dilate = gr.Slider(0, 20, value=default_mask_dilate, step=1,
+                                        show_label=False)
 
-                with gr.Group(elem_classes="wmr-card"):
-                    gr.HTML('<div class="wmr-card-title"><span class="wmr-step">4</span>'
-                            '开始处理</div>')
-                    with gr.Row():
-                        run_btn = gr.Button("开始处理", variant="primary", size="lg",
-                                            scale=3, elem_id="wmr-run")
-                        cancel_btn = gr.Button("取消", size="lg", scale=1,
-                                               elem_id="wmr-cancel")
-                    status = gr.HTML(value=_STATUS_IDLE)
+                gr.HTML(_param_label("LaMa 批大小", "lama_batch_size", _TIP_BATCH))
+                lama_batch = gr.Dropdown(
+                    choices=[("自动（按显存）", 0), ("1（逐帧，最省显存）", 1),
+                             ("2", 2), ("4", 4), ("8", 8), ("16", 16)],
+                    value=default_lama_batch, show_label=False)
 
-                with gr.Group(elem_classes="wmr-card"):
-                    gr.HTML('<div class="wmr-card-title">结果</div>')
-                    result_video = gr.Video(label="预览（第一个处理完的视频）")
-                    result_files = gr.File(label="全部结果（可单个下载）",
-                                           file_count="multiple")
-                    result_zip = gr.File(label="打包下载 zip")
-                    gr.Markdown(
-                        "结果写在系统临时目录里，**关闭本程序前记得下载**。",
-                        elem_classes="wmr-hint")
+                gr.HTML(_param_label("边缘羽化", "feather_px", _TIP_FEATHER))
+                feather_px = gr.Slider(0, 32, value=default_feather, step=1,
+                                       show_label=False)
+
+                gr.HTML(_param_label("ROI 外扩", "padding", _TIP_PADDING))
+                padding = gr.Slider(0, 64, value=default_padding, step=2,
+                                    show_label=False)
+
+                gr.HTML(_param_label("时间轴平滑", "temporal_enable", _TIP_TEMPORAL))
+                temporal_enable = gr.Checkbox(value=default_temporal, show_label=False)
+
+                gr.HTML(_param_label("平滑窗口", "temporal_window", _TIP_WINDOW))
+                temporal_window = gr.Slider(1, 9, value=default_window, step=2,
+                                            show_label=False)
+
+                gr.HTML(_param_label("输出画质", "crf", _TIP_CRF))
+                crf = gr.Slider(14, 28, value=default_crf, step=1, show_label=False)
+
+                gr.HTML(_param_label("编码速度", "preset", _TIP_PRESET))
+                preset = gr.Dropdown(choices=PRESET_CHOICES, value=PRESET_DEFAULT,
+                                     show_label=False)
+
+        # ---- 第四步：开始处理 + 进度 + 结果 + 下载 ----
+        with gr.Group(elem_classes="wmr-card"):
+            gr.HTML('<div class="wmr-card-title"><span class="wmr-step">4</span>'
+                    '开始处理</div>')
+            with gr.Row():
+                run_btn = gr.Button("开始处理", variant="primary", size="lg",
+                                    scale=3, elem_id="wmr-run")
+                cancel_btn = gr.Button("取消", size="lg", scale=1,
+                                       elem_id="wmr-cancel")
+            status = gr.HTML(value=_STATUS_IDLE)
+            result_video = gr.Video(label="预览（第一个处理完的视频）")
+            result_files = gr.File(label="全部结果（可单个下载）",
+                                   file_count="multiple")
+            result_zip = gr.File(label="打包下载 zip")
+            gr.Markdown(
+                "结果写在系统临时目录里，**关闭本程序前记得下载**。",
+                elem_classes="wmr-hint")
 
         files.change(on_upload,
                      inputs=[files],
                      outputs=[canvas, ref_state, status])
         run_btn.click(run_process,
                       inputs=[files, region_json, ref_state, use_manual, mx, my, mw, mh,
-                              method, mask_dilate, feather_px, temporal_enable,
-                              temporal_window, preset, lama_batch],
+                              method, mask_dilate, feather_px, padding,
+                              temporal_enable, temporal_window, crf, preset, lama_batch],
                       outputs=[result_video, result_files, result_zip, status])
         # 取消走单独的并发通道，不会被正在跑的处理任务堵在队列里
         cancel_btn.click(on_cancel, inputs=None, outputs=None,
